@@ -10,7 +10,10 @@ import {
 	stepCountIs,
 } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
+import type { AIProvider, Env as EnvType } from "../types";
 import type { EmailFull, EmailMetadata } from "../lib/schemas";
 import { verifyDraft, isPromptInjection } from "../lib/ai";
 import {
@@ -31,6 +34,28 @@ import {
 } from "../lib/tools";
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
+import { writeAIAnalytics } from "../lib/analytics";
+
+const DEFAULT_MODELS: Record<AIProvider, string> = {
+	workersai: "@cf/moonshotai/kimi-k2.5",
+	anthropic: "claude-sonnet-4-6",
+	openai: "gpt-4o",
+};
+
+function createModel(env: EnvType, mailboxProvider?: AIProvider, mailboxModel?: string) {
+	const provider = mailboxProvider ?? env.AI_PROVIDER ?? "workersai";
+	const model = mailboxModel ?? env.AI_MODEL ?? DEFAULT_MODELS[provider];
+
+	if (provider === "anthropic") {
+		if (!env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is not set");
+		return createAnthropic({ apiKey: env.ANTHROPIC_API_KEY })(model);
+	}
+	if (provider === "openai") {
+		if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set");
+		return createOpenAI({ apiKey: env.OPENAI_API_KEY })(model);
+	}
+	return createWorkersAI({ binding: env.AI })(model);
+}
 
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
@@ -87,24 +112,32 @@ You can ONLY draft emails. You do NOT have the ability to send emails directly.
 ## Draft Management
 Use discard_draft to delete drafts that the operator rejects or that are no longer needed.`;
 
-/**
- * Fetch the custom system prompt for a mailbox from its R2 settings.
- * Falls back to DEFAULT_SYSTEM_PROMPT if none is configured.
- */
-async function getSystemPrompt(env: Env, mailboxId: string): Promise<string> {
+interface MailboxSettings {
+	systemPrompt: string;
+	aiProvider?: AIProvider;
+	aiModel?: string;
+}
+
+async function getMailboxSettings(env: Env, mailboxId: string): Promise<MailboxSettings> {
 	try {
 		const key = `mailboxes/${mailboxId}.json`;
 		const obj = await env.BUCKET.get(key);
 		if (obj) {
 			const settings = await obj.json<Record<string, unknown>>();
-			if (typeof settings.agentSystemPrompt === "string" && settings.agentSystemPrompt.trim()) {
-				return settings.agentSystemPrompt;
-			}
+			return {
+				systemPrompt: typeof settings.agentSystemPrompt === "string" && settings.agentSystemPrompt.trim()
+					? settings.agentSystemPrompt
+					: DEFAULT_SYSTEM_PROMPT,
+				aiProvider: (settings.aiProvider as AIProvider) || undefined,
+				aiModel: typeof settings.aiModel === "string" && settings.aiModel.trim()
+					? settings.aiModel
+					: undefined,
+			};
 		}
 	} catch {
-		// Fall through to default
+		// Fall through to defaults
 	}
-	return DEFAULT_SYSTEM_PROMPT;
+	return { systemPrompt: DEFAULT_SYSTEM_PROMPT };
 }
 
 function createEmailTools(env: Env, mailboxId: string) {
@@ -276,20 +309,47 @@ export class EmailAgent extends AIChatAgent<any> {
 	async onChatMessage(onFinish: any) {
 		const env = this.env as Env;
 		const mailboxId = this.name;
-		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, mailboxId);
-		const systemPrompt = await getSystemPrompt(env, mailboxId);
+		const { systemPrompt, aiProvider, aiModel } = await getMailboxSettings(env, mailboxId);
+		const provider = aiProvider ?? env.AI_PROVIDER ?? "workersai";
+		const model = aiModel ?? env.AI_MODEL ?? DEFAULT_MODELS[provider];
 
-		const result = streamText({
-			model: workersai("@cf/moonshotai/kimi-k2.5"),
-			system: systemPrompt,
-			messages: await convertToModelMessages(this.messages),
-			tools,
-			stopWhen: stepCountIs(5),
-			onFinish,
-		});
+		try {
+			const result = streamText({
+				model: createModel(env, aiProvider, aiModel),
+				system: systemPrompt,
+				messages: await convertToModelMessages(this.messages),
+				tools,
+				stopWhen: stepCountIs(5),
+				onFinish: (r: any) => {
+					if (r.usage) {
+						writeAIAnalytics(env.ANALYTICS_ENGINE, {
+							provider,
+							model,
+							action: "chat",
+							mailboxId,
+							inputTokens: r.usage.inputTokens ?? 0,
+							outputTokens: r.usage.outputTokens ?? 0,
+							totalTokens: r.usage.totalTokens ?? 0,
+							steps: r.steps?.length ?? 0,
+						});
+					}
+					return onFinish?.(r);
+				},
+				onError: (e) => {
+					console.error("[EmailAgent] streamText error:", JSON.stringify(e));
+				},
+			});
 
-		return result.toUIMessageStreamResponse();
+			return result.toUIMessageStreamResponse();
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			console.error("[EmailAgent] onChatMessage error:", msg);
+			return new Response(
+				`data: ${JSON.stringify({ type: "error", error: { message: msg } })}\n\n`,
+				{ headers: { "Content-Type": "text/event-stream" } },
+			);
+		}
 	}
 
 	/**
@@ -334,9 +394,10 @@ export class EmailAgent extends AIChatAgent<any> {
 		threadId: string;
 	}) {
 		const env = this.env as Env;
-		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, emailData.mailboxId);
-		const systemPrompt = await getSystemPrompt(env, emailData.mailboxId);
+		const { systemPrompt, aiProvider, aiModel } = await getMailboxSettings(env, emailData.mailboxId);
+		const autoDraftProvider = aiProvider ?? env.AI_PROVIDER ?? "workersai";
+		const autoDraftModel = aiModel ?? env.AI_MODEL ?? DEFAULT_MODELS[autoDraftProvider];
 
 		// Pre-read the email and thread so the agent has full context
 		// without needing to waste tool calls discovering it
@@ -463,12 +524,25 @@ Based on the email content and thread context above, draft a reply using draft_r
 
 		try {
 			const result = await generateText({
-				model: workersai("@cf/moonshotai/kimi-k2.5"),
+				model: createModel(env, autoDraftProvider as any, autoDraftModel),
 				system: systemPrompt,
 				messages: await convertToModelMessages(messages),
 				tools,
 				stopWhen: stepCountIs(5),
 			});
+
+			if (result.usage) {
+				writeAIAnalytics(env.ANALYTICS_ENGINE, {
+					provider: autoDraftProvider,
+					model: autoDraftModel,
+					action: "auto-draft",
+					mailboxId: emailData.mailboxId,
+					inputTokens: result.usage.inputTokens ?? 0,
+					outputTokens: result.usage.outputTokens ?? 0,
+					totalTokens: result.usage.totalTokens ?? 0,
+					steps: result.steps?.length ?? 0,
+				});
+			}
 
 			// Check if draft_reply was called (saves to Drafts as side effect).
 			// If NOT, save the agent's text response as a draft directly.

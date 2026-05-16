@@ -3,10 +3,26 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { Button, Input, Tooltip } from "@cloudflare/kumo";
-import { GearSixIcon, ListIcon, MagnifyingGlassIcon, RobotIcon, XIcon } from "@phosphor-icons/react";
+import { GearSixIcon, ListIcon, MagnifyingGlassIcon, MoonIcon, RobotIcon, SunIcon, XIcon } from "@phosphor-icons/react";
 import { type KeyboardEvent, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
-import { useUIStore } from "~/hooks/useUIStore";
+import { useUIStore, type Theme } from "~/hooks/useUIStore";
+
+const THEME_CYCLE: Theme[] = ["system", "light", "dark"];
+const THEME_LABELS: Record<Theme, string> = {
+	system: "System theme",
+	light: "Light theme",
+	dark: "Dark theme",
+};
+
+function ThemeIcon({ theme }: { theme: Theme }) {
+	if (theme === "dark") return <MoonIcon size={20} />;
+	if (theme === "light") return <SunIcon size={20} />;
+	// system — show sun/moon based on actual current mode
+	return typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches
+		? <MoonIcon size={20} />
+		: <SunIcon size={20} />;
+}
 
 export default function Header() {
 	const [searchQuery, setSearchQuery] = useState("");
@@ -15,15 +31,19 @@ export default function Header() {
 	const navigate = useNavigate();
 	const location = useLocation();
 	const [searchParams] = useSearchParams();
-	const { toggleSidebar, toggleAgentPanel, isAgentPanelOpen } = useUIStore();
+	const { toggleSidebar, toggleAgentPanel, isAgentPanelOpen, theme, setTheme } = useUIStore();
 
-	// Sync search input with URL query param so it stays populated
 	const urlQuery = searchParams.get("q") || "";
 	useEffect(() => {
 		if (location.pathname.includes("/search") && urlQuery) {
 			setSearchQuery(urlQuery);
 		}
 	}, [urlQuery, location.pathname]);
+
+	const cycleTheme = () => {
+		const next = THEME_CYCLE[(THEME_CYCLE.indexOf(theme) + 1) % THEME_CYCLE.length];
+		setTheme(next);
+	};
 
 	const performSearch = () => {
 		if (mailboxId && searchQuery.trim()) {
@@ -41,15 +61,10 @@ export default function Header() {
 	};
 
 	const handleKeyDown = (e: KeyboardEvent) => {
-		if (e.key === "Enter") {
-			performSearch();
-		}
+		if (e.key === "Enter") performSearch();
 		if (e.key === "Escape") {
-			if (searchQuery) {
-				clearSearch();
-			} else {
-				setIsSearchExpanded(false);
-			}
+			if (searchQuery) clearSearch();
+			else setIsSearchExpanded(false);
 		}
 	};
 
@@ -105,7 +120,7 @@ export default function Header() {
 				</Tooltip>
 			</div>
 
-			{/* Search toggle button - mobile only, hidden when search is expanded */}
+			{/* Search toggle button - mobile only */}
 			{!isSearchExpanded && (
 				<Button
 					variant="ghost"
@@ -119,6 +134,15 @@ export default function Header() {
 			)}
 
 			<div className="flex items-center gap-1 ml-auto shrink-0">
+				<Tooltip content={THEME_LABELS[theme]} side="bottom" asChild>
+					<Button
+						variant="ghost"
+						shape="square"
+						icon={<ThemeIcon theme={theme} />}
+						onClick={cycleTheme}
+						aria-label={THEME_LABELS[theme]}
+					/>
+				</Tooltip>
 				<Tooltip content={isAgentPanelOpen ? "Hide agent panel" : "Show agent panel"} side="bottom" asChild>
 					<Button
 						variant={isAgentPanelOpen ? "secondary" : "ghost"}

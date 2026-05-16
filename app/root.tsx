@@ -12,7 +12,7 @@ import {
 } from "@cloudflare/kumo";
 import { WarningIcon } from "@phosphor-icons/react";
 import { MutationCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { forwardRef, useState } from "react";
+import { forwardRef, useEffect, useState } from "react";
 import {
 	isRouteErrorResponse,
 	Links,
@@ -23,6 +23,7 @@ import {
 	ScrollRestoration,
 } from "react-router";
 import { ApiError } from "~/services/api";
+import { useUIStore } from "~/hooks/useUIStore";
 import "./index.css";
 
 function makeQueryClient() {
@@ -32,7 +33,6 @@ function makeQueryClient() {
 				staleTime: 30_000,
 				refetchOnWindowFocus: false,
 				retry: (failureCount, error) => {
-					// Don't retry 4xx errors (not found, unauthorized, etc.)
 					if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
 						return false;
 					}
@@ -42,23 +42,17 @@ function makeQueryClient() {
 		},
 		mutationCache: new MutationCache({
 			onError: (error) => {
-				// Global fallback for mutations that don't handle errors themselves.
-				// Consumers using mutateAsync + try/catch handle their own errors.
 				console.error("Mutation failed:", error);
 			},
 		}),
 	});
 }
 
-// Lazy singleton for the browser — avoids module-scope instantiation that
-// leaks cache across SSR requests.
 let browserQueryClient: QueryClient | undefined;
 function getQueryClient() {
 	if (typeof window === "undefined") {
-		// SSR: always create a fresh client per request to prevent cross-user cache leaks
 		return makeQueryClient();
 	}
-	// Browser: reuse the same client across navigations
 	if (!browserQueryClient) browserQueryClient = makeQueryClient();
 	return browserQueryClient;
 }
@@ -74,6 +68,42 @@ const KumoLink = forwardRef<
 	}
 	return <a href={href} ref={ref} {...props} />;
 });
+
+// Runs before React hydrates to prevent flash of wrong theme.
+// Content is a hardcoded constant — not user input, no XSS risk.
+const THEME_INIT_SCRIPT = [
+	"(function(){",
+	"try{",
+	"var s=JSON.parse(localStorage.getItem('agentic-inbox-ui')||'{}');",
+	"var t=(s.state&&s.state.theme)||'system';",
+	"var d=t==='dark'||(t==='system'&&window.matchMedia('(prefers-color-scheme:dark)').matches);",
+	"document.documentElement.setAttribute('data-mode',d?'dark':'light');",
+	"}catch(e){}",
+	"})();",
+].join("");
+
+function ThemeSync() {
+	const theme = useUIStore((s) => s.theme);
+
+	useEffect(() => {
+		const apply = () => {
+			const isDark =
+				theme === "dark" ||
+				(theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+			document.documentElement.setAttribute("data-mode", isDark ? "dark" : "light");
+		};
+
+		apply();
+
+		if (theme === "system") {
+			const mq = window.matchMedia("(prefers-color-scheme: dark)");
+			mq.addEventListener("change", apply);
+			return () => mq.removeEventListener("change", apply);
+		}
+	}, [theme]);
+
+	return null;
+}
 
 export function Layout({ children }: { children: React.ReactNode }) {
 	return (
@@ -91,6 +121,10 @@ export function Layout({ children }: { children: React.ReactNode }) {
 				<title>Agentic Inbox</title>
 				<Meta />
 				<Links />
+				<script
+					// biome-ignore lint/security/noDangerouslySetInnerHtml: hardcoded constant, not user input
+					dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }}
+				/>
 			</head>
 			<body className="bg-kumo-recessed text-kumo-default antialiased">
 				{children}
@@ -110,14 +144,13 @@ export function HydrateFallback() {
 }
 
 export default function App() {
-	// Use useState to ensure each SSR request gets a fresh client while the
-	// browser reuses the same singleton across navigations.
 	const [queryClient] = useState(getQueryClient);
 	return (
 		<QueryClientProvider client={queryClient}>
 			<LinkProvider component={KumoLink}>
 				<TooltipProvider>
 					<Toasty>
+						<ThemeSync />
 						<Outlet />
 					</Toasty>
 				</TooltipProvider>

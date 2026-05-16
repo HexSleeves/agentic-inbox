@@ -83,6 +83,110 @@ app.use("/api/*", cors({
 }));
 app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 
+// -- Analytics ------------------------------------------------------
+
+const ANALYTICS_QUERIES = {
+	costOverTime: (days: number) => `
+		SELECT
+			toDate(timestamp) AS day,
+			SUM(double4) AS cost_microdollars,
+			SUM(double1) AS prompt_tokens,
+			SUM(double2) AS completion_tokens,
+			SUM(double3) AS total_tokens,
+			COUNT(*) AS calls
+		FROM analytics_events
+		WHERE timestamp >= NOW() - INTERVAL '${days}' DAY
+		GROUP BY day
+		ORDER BY day ASC`,
+
+	byModel: (days: number) => `
+		SELECT
+			blob1 AS provider,
+			blob2 AS model,
+			SUM(double4) AS cost_microdollars,
+			SUM(double3) AS total_tokens,
+			COUNT(*) AS calls
+		FROM analytics_events
+		WHERE timestamp >= NOW() - INTERVAL '${days}' DAY
+		GROUP BY provider, model
+		ORDER BY cost_microdollars DESC`,
+
+	byAction: (days: number) => `
+		SELECT
+			blob3 AS action,
+			SUM(double4) AS cost_microdollars,
+			SUM(double3) AS total_tokens,
+			COUNT(*) AS calls
+		FROM analytics_events
+		WHERE timestamp >= NOW() - INTERVAL '${days}' DAY
+		GROUP BY action`,
+
+	byMailbox: (days: number) => `
+		SELECT
+			blob4 AS mailbox,
+			SUM(double4) AS cost_microdollars,
+			SUM(double3) AS total_tokens,
+			COUNT(*) AS calls
+		FROM analytics_events
+		WHERE timestamp >= NOW() - INTERVAL '${days}' DAY
+		GROUP BY mailbox
+		ORDER BY cost_microdollars DESC
+		LIMIT 20`,
+
+	totals: (days: number) => `
+		SELECT
+			SUM(double4) AS cost_microdollars,
+			SUM(double1) AS prompt_tokens,
+			SUM(double2) AS completion_tokens,
+			SUM(double3) AS total_tokens,
+			COUNT(*) AS calls,
+			AVG(double5) AS avg_steps
+		FROM analytics_events
+		WHERE timestamp >= NOW() - INTERVAL '${days}' DAY`,
+} as const;
+
+async function queryAnalyticsEngine(accountId: string, apiToken: string, sql: string) {
+	const resp = await fetch(
+		`https://api.cloudflare.com/client/v4/accounts/${accountId}/analytics_engine/sql`,
+		{
+			method: "POST",
+			headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "text/plain" },
+			body: sql,
+		},
+	);
+	if (!resp.ok) {
+		const text = await resp.text();
+		throw new Error(`Analytics Engine query failed (${resp.status}): ${text}`);
+	}
+	return resp.json<{ data: Record<string, unknown>[]; rows: number; meta: unknown[] }>();
+}
+
+app.get("/api/v1/analytics", async (c) => {
+	const accountId = c.env.CF_ACCOUNT_ID;
+	const apiToken = c.env.CF_API_TOKEN;
+	if (!accountId || !apiToken) {
+		return c.json({ error: "Analytics not configured. Set CF_ACCOUNT_ID var and CF_API_TOKEN secret." }, 503);
+	}
+
+	const daysParam = c.req.query("days") ?? "30";
+	const days = Math.min(90, Math.max(1, parseInt(daysParam, 10) || 30));
+
+	try {
+		const [costOverTime, byModel, byAction, byMailbox, totals] = await Promise.all([
+			queryAnalyticsEngine(accountId, apiToken, ANALYTICS_QUERIES.costOverTime(days)),
+			queryAnalyticsEngine(accountId, apiToken, ANALYTICS_QUERIES.byModel(days)),
+			queryAnalyticsEngine(accountId, apiToken, ANALYTICS_QUERIES.byAction(days)),
+			queryAnalyticsEngine(accountId, apiToken, ANALYTICS_QUERIES.byMailbox(days)),
+			queryAnalyticsEngine(accountId, apiToken, ANALYTICS_QUERIES.totals(days)),
+		]);
+
+		return c.json({ days, costOverTime: costOverTime.data, byModel: byModel.data, byAction: byAction.data, byMailbox: byMailbox.data, totals: totals.data[0] ?? null });
+	} catch (e) {
+		console.error("Analytics query failed:", (e as Error).message);
+		return c.json({ error: (e as Error).message }, 500);
+	}
+});
+
 // -- Config ---------------------------------------------------------
 
 app.get("/api/v1/config", (c) => {
