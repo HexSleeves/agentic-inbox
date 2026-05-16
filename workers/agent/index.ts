@@ -36,6 +36,30 @@ import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "
 import type { Env } from "../types";
 import { writeAIAnalytics } from "../lib/analytics";
 
+// Anthropic requires tool call IDs to match ^[a-zA-Z0-9_-]+$.
+// Workers AI may produce IDs with other chars (e.g. colons, dots).
+// We sanitize consistently so tool-use and tool-result IDs remain paired.
+function sanitizeToolCallIds(messages: any[]): any[] {
+	const idMap = new Map<string, string>();
+	const sanitize = (id: string): string => {
+		if (!id || /^[a-zA-Z0-9_-]+$/.test(id)) return id;
+		if (!idMap.has(id)) idMap.set(id, id.replace(/[^a-zA-Z0-9_-]/g, "_"));
+		return idMap.get(id)!;
+	};
+	return messages.map((msg: any) => {
+		if (!msg?.parts) return msg;
+		const parts = msg.parts.map((part: any) => {
+			// ToolUIPart has type `tool-${name}`, DynamicToolUIPart has type `dynamic-tool`.
+			// toolCallId is directly on the part (not nested under toolInvocation).
+			if (part?.toolCallId && (part.type === "dynamic-tool" || part.type?.startsWith("tool-"))) {
+				return { ...part, toolCallId: sanitize(part.toolCallId) };
+			}
+			return part;
+		});
+		return { ...msg, parts };
+	});
+}
+
 const DEFAULT_MODELS: Record<AIProvider, string> = {
 	workersai: "@cf/moonshotai/kimi-k2.5",
 	anthropic: "claude-sonnet-4-6",
@@ -318,7 +342,7 @@ export class EmailAgent extends AIChatAgent<any> {
 			const result = streamText({
 				model: createModel(env, aiProvider, aiModel),
 				system: systemPrompt,
-				messages: await convertToModelMessages(this.messages),
+				messages: await convertToModelMessages(sanitizeToolCallIds(this.messages)),
 				tools,
 				stopWhen: stepCountIs(5),
 				onFinish: (r: any) => {
@@ -336,15 +360,17 @@ export class EmailAgent extends AIChatAgent<any> {
 					}
 					return onFinish?.(r);
 				},
-				onError: (e) => {
-					console.error("[EmailAgent] streamText error:", JSON.stringify(e));
+				onError: (e: any) => {
+					const err = e?.error ?? e;
+					console.error("[EmailAgent] streamText error:", err instanceof Error ? err.stack : JSON.stringify(err));
 				},
 			});
 
 			return result.toUIMessageStreamResponse();
 		} catch (e) {
-			const msg = e instanceof Error ? e.message : String(e);
-			console.error("[EmailAgent] onChatMessage error:", msg);
+			const err = e instanceof Error ? e : new Error(String(e));
+			console.error("[EmailAgent] onChatMessage error:", err.stack ?? err.message);
+			const msg = err.message;
 			return new Response(
 				`data: ${JSON.stringify({ type: "error", error: { message: msg } })}\n\n`,
 				{ headers: { "Content-Type": "text/event-stream" } },
@@ -526,7 +552,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 			const result = await generateText({
 				model: createModel(env, autoDraftProvider as any, autoDraftModel),
 				system: systemPrompt,
-				messages: await convertToModelMessages(messages),
+				messages: await convertToModelMessages(sanitizeToolCallIds(messages)),
 				tools,
 				stopWhen: stepCountIs(5),
 			});
