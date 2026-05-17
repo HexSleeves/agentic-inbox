@@ -449,38 +449,44 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
-async function receiveEmail(event: { raw: ReadableStream; rawSize: number; rcptTo?: string; mailFrom?: string }, env: Env, ctx: ExecutionContext) {
+async function receiveEmail(event: { raw: ReadableStream; rawSize: number; to?: string; from?: string }, env: Env, ctx: ExecutionContext) {
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);
-
-	// Use the SMTP envelope recipient (event.rcptTo) as the authoritative delivery address.
-	// parsedEmail.to is the "To:" header which for forwarded emails (e.g. Gmail forwarding)
-	// still contains the original recipient, not the actual delivery address.
-	const envelopeTo = event.rcptTo?.toLowerCase();
 
 	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
 	const allRecipients = parsedEmail.to?.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[] ?? [];
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 
-	let mailboxId: string | undefined;
-	if (allowedAddresses.length > 0) {
-		// Prefer envelope recipient if it matches an allowed address
-		if (envelopeTo && allowedAddresses.includes(envelopeTo)) {
-			mailboxId = envelopeTo;
-		} else {
-			mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		}
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else {
-		// Prefer envelope recipient; fall back to To: header
-		mailboxId = envelopeTo || allRecipients[0];
+	// Collect candidate delivery addresses in priority order:
+	// 1. event.to (Cloudflare's property — may be header or envelope depending on runtime)
+	// 2. Gmail CAF encoded in MAIL FROM: user+caf_=rcptUser=rcptDomain@gmail.com
+	// 3. Delivered-To / X-Original-To / X-Forwarded-To headers
+	// 4. To: header recipients
+	const candidates: string[] = [];
+	if (event.to) candidates.push(event.to.toLowerCase());
+	const cafMatch = (event.from ?? "").match(/\+caf_=([^=@]+)=([^@]+)@/i);
+	if (cafMatch) candidates.push(`${cafMatch[1]}@${cafMatch[2]}`.toLowerCase());
+	for (const name of ["delivered-to", "x-original-to", "x-forwarded-to"]) {
+		const h = (parsedEmail.headers as { key: string; value: string }[] | undefined)?.find((h) => h.key.toLowerCase() === name);
+		if (h) { const addr = h.value.match(/<([^>]+)>/)?.[1] || h.value.trim(); if (addr) candidates.push(addr.toLowerCase()); }
 	}
-	if (!mailboxId) throw new Error("received email with no valid recipient address");
+	for (const r of allRecipients) candidates.push(r);
+
+	// Find the first candidate that has an existing mailbox (and passes allowlist if configured)
+	let mailboxId: string | undefined;
+	for (const addr of candidates) {
+		if (allowedAddresses.length > 0 && !allowedAddresses.includes(addr)) continue;
+		if (await env.BUCKET.head(`mailboxes/${addr}.json`)) { mailboxId = addr; break; }
+	}
+
+	if (!mailboxId) {
+		const tried = [...new Set(candidates)].join(", ");
+		console.log(`Ignoring email: no mailbox found for candidates [${tried}]`);
+		return;
+	}
 
 	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
-
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
 
 	const attachmentData: StoredAttachment[] = [];
