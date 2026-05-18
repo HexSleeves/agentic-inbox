@@ -7,11 +7,13 @@ import {
 	ArchiveIcon,
 	ArrowBendUpLeftIcon,
 	ArrowsClockwiseIcon,
+	CheckSquareIcon,
 	EnvelopeOpenIcon,
 	EnvelopeSimpleIcon,
 	FileIcon,
 	PaperPlaneTiltIcon,
 	PencilSimpleIcon,
+	SquareIcon,
 	StarIcon,
 	TrashIcon,
 	TrayIcon,
@@ -29,6 +31,7 @@ import {
 	useMarkThreadRead,
 	useUpdateEmail,
 } from "~/queries/emails";
+import api from "~/services/api";
 import { useFolders } from "~/queries/folders";
 import { queryKeys } from "~/queries/keys";
 import { useUIStore } from "~/hooks/useUIStore";
@@ -153,6 +156,8 @@ export default function EmailListRoute() {
 		startCompose,
 	} = useUIStore();
 	const [page, setPage] = useState(1);
+	const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+	const [isBulkDeleting, setIsBulkDeleting] = useState(false);
 
 	const queryClient = useQueryClient();
 	const updateEmail = useUpdateEmail();
@@ -186,6 +191,37 @@ export default function EmailListRoute() {
 
 	const isPanelOpen = selectedEmailId !== null || isComposing;
 
+	const toggleSelectEmail = (e: React.MouseEvent, id: string) => {
+		e.stopPropagation();
+		setSelectedIds((prev) => {
+			const next = new Set(prev);
+			if (next.has(id)) next.delete(id); else next.add(id);
+			return next;
+		});
+	};
+
+	const toggleSelectAll = () => {
+		if (selectedIds.size === emails.length) {
+			setSelectedIds(new Set());
+		} else {
+			setSelectedIds(new Set(emails.map((e) => e.id)));
+		}
+	};
+
+	const handleBulkDelete = async () => {
+		if (!mailboxId || selectedIds.size === 0) return;
+		setIsBulkDeleting(true);
+		try {
+			await Promise.all([...selectedIds].map((id) => api.deleteEmail(mailboxId, id)));
+			setSelectedIds(new Set());
+			queryClient.invalidateQueries({ queryKey: ["emails", mailboxId] });
+			queryClient.invalidateQueries({ queryKey: queryKeys.folders.list(mailboxId) });
+			if (selectedIds.has(selectedEmailId ?? "")) closePanel();
+		} finally {
+			setIsBulkDeleting(false);
+		}
+	};
+
 	// Track folder identity to detect folder changes vs page changes
 	const prevFolderRef = useRef<string | undefined>(undefined);
 
@@ -196,6 +232,7 @@ export default function EmailListRoute() {
 		if (folderChanged) {
 			closePanel();
 			setPage(1);
+			setSelectedIds(new Set());
 		}
 	}, [mailboxId, folder, closePanel]);
 
@@ -275,36 +312,74 @@ export default function EmailListRoute() {
 		>
 				{/* Folder header */}
 				<div className="flex items-center justify-between px-4 py-3.5 border-b border-kumo-line shrink-0 md:px-5">
-					<h1 className="text-lg font-semibold text-kumo-default">
-						{folderName}
-					</h1>
-					<div className="flex items-center gap-1">
-						{totalCount > 0 && (
-							<span className="text-sm text-kumo-subtle mr-2 hidden sm:inline">
-								{totalCount} conversation{totalCount !== 1 ? "s" : ""}
-							</span>
-						)}
-						<Tooltip
-							content={isRefreshing ? "Refreshing..." : "Refresh"}
-							side="bottom"
-							asChild
-						>
-							<Button
-								variant="ghost"
-								shape="square"
-								size="sm"
-								icon={
-									<ArrowsClockwiseIcon
-										size={18}
-										className={isRefreshing ? "animate-spin" : ""}
+					{selectedIds.size > 0 ? (
+						<>
+							<div className="flex items-center gap-2">
+								<button
+									type="button"
+									className="p-0.5 bg-transparent border-0 cursor-pointer text-kumo-subtle hover:text-kumo-default"
+									onClick={toggleSelectAll}
+									aria-label="Deselect all"
+								>
+									<CheckSquareIcon size={18} weight="fill" className="text-kumo-brand" />
+								</button>
+								<span className="text-sm font-medium text-kumo-default">
+									{selectedIds.size} selected
+								</span>
+							</div>
+							<div className="flex items-center gap-1">
+								<Button
+									variant="ghost"
+									size="sm"
+									icon={<TrashIcon size={14} />}
+									onClick={handleBulkDelete}
+									disabled={isBulkDeleting}
+								>
+									{isBulkDeleting ? "Deleting..." : "Delete"}
+								</Button>
+								<Button
+									variant="ghost"
+									size="sm"
+									onClick={() => setSelectedIds(new Set())}
+								>
+									Cancel
+								</Button>
+							</div>
+						</>
+					) : (
+						<>
+							<h1 className="text-lg font-semibold text-kumo-default">
+								{folderName}
+							</h1>
+							<div className="flex items-center gap-1">
+								{totalCount > 0 && (
+									<span className="text-sm text-kumo-subtle mr-2 hidden sm:inline">
+										{totalCount} conversation{totalCount !== 1 ? "s" : ""}
+									</span>
+								)}
+								<Tooltip
+									content={isRefreshing ? "Refreshing..." : "Refresh"}
+									side="bottom"
+									asChild
+								>
+									<Button
+										variant="ghost"
+										shape="square"
+										size="sm"
+										icon={
+											<ArrowsClockwiseIcon
+												size={18}
+												className={isRefreshing ? "animate-spin" : ""}
+											/>
+										}
+										onClick={handleRefresh}
+										disabled={isRefreshing}
+										aria-label="Refresh"
 									/>
-								}
-								onClick={handleRefresh}
-								disabled={isRefreshing}
-								aria-label="Refresh"
-							/>
-						</Tooltip>
-					</div>
+								</Tooltip>
+							</div>
+						</>
+					)}
 				</div>
 
 				{/* Email rows */}
@@ -332,10 +407,35 @@ export default function EmailListRoute() {
 											isPanelOpen ? "md:px-4 md:py-2.5" : ""
 										} ${isSelected ? "bg-kumo-tint" : "hover:bg-kumo-tint"}`}
 									>
-										{/* Unread dot */}
-										<div className="w-2.5 shrink-0 flex justify-center">
-											{hasUnread(email) && (
-												<div className="h-2 w-2 rounded-full bg-kumo-brand" />
+										{/* Unread dot / checkbox */}
+										<div className="w-4 shrink-0 flex justify-center">
+											{selectedIds.has(email.id) ? (
+												<button
+													type="button"
+													className="p-0 bg-transparent border-0 cursor-pointer leading-none"
+													onClick={(e) => toggleSelectEmail(e, email.id)}
+													aria-label="Deselect"
+												>
+													<CheckSquareIcon size={16} weight="fill" className="text-kumo-brand" />
+												</button>
+											) : (
+												<button
+													type="button"
+													className="p-0 bg-transparent border-0 cursor-pointer leading-none relative"
+													onClick={(e) => toggleSelectEmail(e, email.id)}
+													aria-label="Select"
+												>
+													{/* dot visible when unread and not hovered */}
+													{hasUnread(email) && (
+														<span className="group-hover:hidden flex items-center justify-center w-4 h-4">
+															<span className="h-2 w-2 rounded-full bg-kumo-brand block" />
+														</span>
+													)}
+													{/* checkbox visible on hover */}
+													<span className={hasUnread(email) ? "hidden group-hover:flex items-center justify-center" : "flex items-center justify-center opacity-0 group-hover:opacity-100"}>
+														<SquareIcon size={16} className="text-kumo-subtle" />
+													</span>
+												</button>
 											)}
 										</div>
 
